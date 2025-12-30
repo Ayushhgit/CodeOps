@@ -9,21 +9,33 @@ Handles all interactions with the GitHub API including:
 - Check runs
 
 IMPORTANT: All write operations go through the safety model.
+
+Features:
+- Token refresh with locking (prevents token refresh storm)
+- Circuit breaker pattern (prevents cascading failures)
+- Retry with exponential backoff
+- Comprehensive error handling
 """
 
-from dataclasses import dataclass
+import asyncio
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any
 
 import httpx
 import jwt
+import structlog
 
 from app.core.config import settings
 from app.core.permissions import (
-    PROTECTED_BRANCHES,
     PermissionLevel,
     validate_branch_name,
 )
+
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -74,21 +86,112 @@ class GitHubCommit:
 class GitHubClientError(Exception):
     """Base exception for GitHub client errors."""
 
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(self, message: str, status_code: int | None = None, retryable: bool = False):
         super().__init__(message)
         self.status_code = status_code
+        self.retryable = retryable
 
 
 class GitHubRateLimitError(GitHubClientError):
     """Raised when GitHub rate limit is exceeded."""
 
-    pass
+    def __init__(self, message: str, retry_after: int | None = None):
+        super().__init__(message, status_code=429, retryable=True)
+        self.retry_after = retry_after
 
 
 class GitHubPermissionError(GitHubClientError):
     """Raised when operation is not permitted."""
 
-    pass
+    def __init__(self, message: str):
+        super().__init__(message, status_code=403, retryable=False)
+
+
+class GitHubNotFoundError(GitHubClientError):
+    """Raised when resource is not found."""
+
+    def __init__(self, message: str):
+        super().__init__(message, status_code=404, retryable=False)
+
+
+class CircuitBreakerState(Enum):
+    """Circuit breaker states."""
+
+    CLOSED = "closed"  # Normal operation
+    OPEN = "open"      # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing if service recovered
+
+
+@dataclass
+class CircuitBreaker:
+    """
+    Circuit breaker pattern implementation.
+
+    Prevents cascading failures by failing fast when a service is down.
+    """
+
+    failure_threshold: int = 5
+    recovery_timeout: float = 30.0
+    half_open_max_calls: int = 3
+
+    _state: CircuitBreakerState = field(default=CircuitBreakerState.CLOSED, init=False)
+    _failure_count: int = field(default=0, init=False)
+    _last_failure_time: float | None = field(default=None, init=False)
+    _half_open_calls: int = field(default=0, init=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+
+    @property
+    def state(self) -> CircuitBreakerState:
+        """Get current circuit breaker state."""
+        return self._state
+
+    async def can_execute(self) -> bool:
+        """Check if a request can be executed."""
+        async with self._lock:
+            if self._state == CircuitBreakerState.CLOSED:
+                return True
+
+            if self._state == CircuitBreakerState.OPEN:
+                # Check if recovery timeout has passed
+                if self._last_failure_time and \
+                   time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = CircuitBreakerState.HALF_OPEN
+                    self._half_open_calls = 0
+                    logger.info("Circuit breaker entering half-open state")
+                    return True
+                return False
+
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                if self._half_open_calls < self.half_open_max_calls:
+                    self._half_open_calls += 1
+                    return True
+                return False
+
+            return False
+
+    async def record_success(self) -> None:
+        """Record a successful request."""
+        async with self._lock:
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.CLOSED
+                logger.info("Circuit breaker closed - service recovered")
+            self._failure_count = 0
+
+    async def record_failure(self) -> None:
+        """Record a failed request."""
+        async with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.OPEN
+                logger.warning("Circuit breaker reopened - service still failing")
+            elif self._failure_count >= self.failure_threshold:
+                self._state = CircuitBreakerState.OPEN
+                logger.warning(
+                    "Circuit breaker opened",
+                    failure_count=self._failure_count,
+                )
 
 
 class GitHubClient:
@@ -96,9 +199,16 @@ class GitHubClient:
     GitHub API client with safety controls.
 
     All write operations are gated by permission checks.
+
+    Features:
+    - Thread-safe token refresh with locking
+    - Circuit breaker for fault tolerance
+    - Retry with exponential backoff
     """
 
     BASE_URL = "https://api.github.com"
+    MAX_RETRIES = 3
+    BASE_RETRY_DELAY = 1.0  # seconds
 
     def __init__(self, installation_id: int):
         """
@@ -109,10 +219,12 @@ class GitHubClient:
         """
         self.installation_id = installation_id
         self._token: str | None = None
-        self._token_expires: datetime | None = None
+        self._token_expires: float | None = None  # Unix timestamp
+        self._token_lock = asyncio.Lock()
+        self._circuit_breaker = CircuitBreaker()
         self._client = httpx.AsyncClient(
             base_url=self.BASE_URL,
-            timeout=30.0,
+            timeout=httpx.Timeout(30.0, connect=10.0),
         )
 
     async def __aenter__(self):
@@ -123,43 +235,75 @@ class GitHubClient:
         await self._client.aclose()
 
     async def _ensure_token(self) -> None:
-        """Ensure we have a valid installation access token."""
-        if self._token and self._token_expires and datetime.utcnow() < self._token_expires:
+        """
+        Ensure we have a valid installation access token.
+
+        Uses locking to prevent multiple concurrent refresh attempts.
+        """
+        # Quick check without lock
+        if self._token and self._token_expires and time.time() < self._token_expires:
             return
 
-        # Generate JWT for app authentication
-        app_jwt = self._generate_app_jwt()
+        # Acquire lock for token refresh
+        async with self._token_lock:
+            # Double-check after acquiring lock (another coroutine may have refreshed)
+            if self._token and self._token_expires and time.time() < self._token_expires:
+                return
 
-        # Get installation access token
-        response = await self._client.post(
-            f"/app/installations/{self.installation_id}/access_tokens",
-            headers={
-                "Authorization": f"Bearer {app_jwt}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
+            logger.debug("Refreshing GitHub installation token")
 
-        if response.status_code != 201:
-            raise GitHubClientError(
-                f"Failed to get installation token: {response.text}",
-                response.status_code,
-            )
+            # Generate JWT for app authentication
+            app_jwt = self._generate_app_jwt()
 
-        data = response.json()
-        self._token = data["token"]
-        # Token expires in 1 hour, refresh 5 minutes early
-        self._token_expires = datetime.utcnow() + timedelta(minutes=55)
+            # Get installation access token with retry
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    response = await self._client.post(
+                        f"/app/installations/{self.installation_id}/access_tokens",
+                        headers={
+                            "Authorization": f"Bearer {app_jwt}",
+                            "Accept": "application/vnd.github+json",
+                            "X-GitHub-Api-Version": "2022-11-28",
+                        },
+                    )
+
+                    if response.status_code == 201:
+                        data = response.json()
+                        self._token = data["token"]
+                        # Token expires in 1 hour, refresh 5 minutes early
+                        self._token_expires = time.time() + (55 * 60)
+                        logger.debug("GitHub token refreshed successfully")
+                        return
+
+                    if response.status_code >= 500:
+                        # Server error, retry
+                        if attempt < self.MAX_RETRIES - 1:
+                            delay = self.BASE_RETRY_DELAY * (2 ** attempt)
+                            await asyncio.sleep(delay)
+                            continue
+
+                    raise GitHubClientError(
+                        f"Failed to get installation token: {response.text}",
+                        response.status_code,
+                    )
+
+                except httpx.RequestError as e:
+                    if attempt < self.MAX_RETRIES - 1:
+                        delay = self.BASE_RETRY_DELAY * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                    raise GitHubClientError(f"Network error: {str(e)}", retryable=True)
 
     def _generate_app_jwt(self) -> str:
         """Generate JWT for GitHub App authentication."""
         if not settings.github_app_private_key:
             raise GitHubClientError("GitHub App private key not configured")
 
-        now = datetime.utcnow()
+        # Use integer timestamps for JWT claims
+        now = int(time.time())
         payload = {
             "iat": now,
-            "exp": now + timedelta(minutes=10),
+            "exp": now + (10 * 60),  # 10 minutes
             "iss": settings.github_app_id,
         }
 
@@ -184,33 +328,109 @@ class GitHubClient:
         self,
         method: str,
         path: str,
+        retry: bool = True,
         **kwargs,
     ) -> dict[str, Any]:
-        """Make an API request with error handling."""
-        await self._ensure_token()
+        """
+        Make an API request with error handling, circuit breaker, and retry.
 
-        response = await self._client.request(
-            method,
-            path,
-            headers=self._headers(),
-            **kwargs,
-        )
+        Args:
+            method: HTTP method
+            path: API path
+            retry: Whether to retry on failure
+            **kwargs: Additional arguments for httpx
 
-        if response.status_code == 403:
-            if "rate limit" in response.text.lower():
-                raise GitHubRateLimitError("GitHub rate limit exceeded")
-            raise GitHubPermissionError(f"Permission denied: {response.text}")
-
-        if response.status_code >= 400:
+        Returns:
+            JSON response data
+        """
+        # Check circuit breaker
+        if not await self._circuit_breaker.can_execute():
             raise GitHubClientError(
-                f"GitHub API error: {response.text}",
-                response.status_code,
+                "Circuit breaker is open - GitHub API temporarily unavailable",
+                retryable=True,
             )
 
-        if response.status_code == 204:
-            return {}
+        await self._ensure_token()
 
-        return response.json()
+        last_error: Exception | None = None
+        max_attempts = self.MAX_RETRIES if retry else 1
+
+        for attempt in range(max_attempts):
+            try:
+                response = await self._client.request(
+                    method,
+                    path,
+                    headers=self._headers(),
+                    **kwargs,
+                )
+
+                # Handle different status codes
+                if response.status_code == 204:
+                    await self._circuit_breaker.record_success()
+                    return {}
+
+                if response.status_code < 300:
+                    await self._circuit_breaker.record_success()
+                    return response.json()
+
+                # Error handling
+                if response.status_code == 401:
+                    # Token might be invalid, clear it and retry
+                    self._token = None
+                    self._token_expires = None
+                    if attempt < max_attempts - 1:
+                        await self._ensure_token()
+                        continue
+                    raise GitHubClientError("Authentication failed", 401)
+
+                if response.status_code == 403:
+                    error_text = response.text.lower()
+                    if "rate limit" in error_text:
+                        retry_after = response.headers.get("Retry-After")
+                        await self._circuit_breaker.record_failure()
+                        raise GitHubRateLimitError(
+                            "GitHub rate limit exceeded",
+                            retry_after=int(retry_after) if retry_after else None,
+                        )
+                    raise GitHubPermissionError(f"Permission denied: {response.text}")
+
+                if response.status_code == 404:
+                    raise GitHubNotFoundError(f"Not found: {path}")
+
+                if response.status_code >= 500:
+                    # Server error, retry with backoff
+                    await self._circuit_breaker.record_failure()
+                    if attempt < max_attempts - 1:
+                        delay = self.BASE_RETRY_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "GitHub server error, retrying",
+                            status_code=response.status_code,
+                            attempt=attempt + 1,
+                            delay=delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                raise GitHubClientError(
+                    f"GitHub API error: {response.text}",
+                    response.status_code,
+                )
+
+            except httpx.RequestError as e:
+                await self._circuit_breaker.record_failure()
+                last_error = e
+                if attempt < max_attempts - 1:
+                    delay = self.BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "Network error, retrying",
+                        error=str(e),
+                        attempt=attempt + 1,
+                        delay=delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+        raise GitHubClientError(f"Request failed after {max_attempts} attempts: {last_error}")
 
     # =========================================================================
     # READ OPERATIONS (Level 0+)

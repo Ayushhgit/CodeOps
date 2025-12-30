@@ -22,12 +22,20 @@ from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.api import router
+from app.api.middleware import (
+    CorrelationIdMiddleware,
+    InputValidationMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+    get_correlation_id,
+)
 from app.core.config import settings
 
 
-# Configure structured logging
+# Configure structured logging with correlation ID support
 structlog.configure(
     processors=[
+        structlog.contextvars.merge_contextvars,  # Merge correlation ID from context
         structlog.stdlib.filter_by_level,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
@@ -81,7 +89,8 @@ app = FastAPI(
     redoc_url="/redoc" if settings.debug else None,
 )
 
-# CORS middleware
+# Middleware stack (order matters - first added = last executed)
+# 1. CORS middleware (outermost - handles preflight)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if settings.debug else ["https://github.com"],
@@ -90,11 +99,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 2. Security headers middleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# 3. Correlation ID middleware (for distributed tracing)
+app.add_middleware(CorrelationIdMiddleware)
+
+# 4. Input validation middleware (reject bad requests early)
+app.add_middleware(InputValidationMiddleware)
+
+# 5. Rate limiting middleware (protect against abuse)
+app.add_middleware(RateLimitMiddleware)
+
 
 # Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all incoming requests."""
+    """Log all incoming requests with correlation ID."""
     start_time = datetime.utcnow()
 
     # Skip health check logging in production
@@ -111,6 +132,7 @@ async def log_requests(request: Request, call_next):
         path=request.url.path,
         status_code=response.status_code,
         duration_ms=round(duration_ms, 2),
+        correlation_id=get_correlation_id(),
     )
 
     return response
@@ -119,12 +141,15 @@ async def log_requests(request: Request, call_next):
 # Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Handle unhandled exceptions."""
+    """Handle unhandled exceptions with correlation ID."""
+    correlation_id = get_correlation_id()
+
     logger.error(
         "Unhandled exception",
         path=request.url.path,
         method=request.method,
         error=str(exc),
+        correlation_id=correlation_id,
         exc_info=exc,
     )
 
@@ -133,7 +158,9 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={
             "error": "Internal server error",
             "message": str(exc) if settings.debug else "An unexpected error occurred",
+            "correlation_id": correlation_id,
         },
+        headers={"X-Correlation-ID": correlation_id},
     )
 
 

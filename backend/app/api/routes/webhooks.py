@@ -28,23 +28,27 @@ async def github_webhook(
     # Get raw body for signature verification
     body = await request.body()
 
-    # Verify signature
-    if x_hub_signature_256:
-        if not webhook_processor.verify_signature(body, x_hub_signature_256):
-            logger.warning(
-                "Invalid webhook signature",
-                delivery_id=x_github_delivery,
-                event=x_github_event,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid webhook signature",
-            )
-    else:
-        logger.warning(
-            "Webhook received without signature",
+    # Verify signature - SECURITY: Signature is REQUIRED, reject unsigned webhooks
+    if not x_hub_signature_256:
+        logger.error(
+            "Webhook rejected: missing signature",
             delivery_id=x_github_delivery,
             event=x_github_event,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing webhook signature. X-Hub-Signature-256 header is required.",
+        )
+
+    if not webhook_processor.verify_signature(body, x_hub_signature_256):
+        logger.error(
+            "Webhook rejected: invalid signature",
+            delivery_id=x_github_delivery,
+            event=x_github_event,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook signature",
         )
 
     # Parse payload

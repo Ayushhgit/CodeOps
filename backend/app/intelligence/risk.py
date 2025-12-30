@@ -10,7 +10,7 @@ Analyzes the repository to identify areas of high risk:
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from app.intelligence.analyzer import FileAnalysis
@@ -92,6 +92,21 @@ class RiskAnalyzer:
         """
         self.graph = graph
         self._centrality_cache: dict[str, float] | None = None
+        self._cache_timestamp: datetime | None = None
+        self._cache_ttl = timedelta(minutes=5)  # Cache TTL
+
+    def invalidate_cache(self) -> None:
+        """Invalidate the centrality cache."""
+        self._centrality_cache = None
+        self._cache_timestamp = None
+
+    def _is_cache_valid(self) -> bool:
+        """Check if the centrality cache is still valid."""
+        if self._centrality_cache is None:
+            return False
+        if self._cache_timestamp is None:
+            return False
+        return datetime.utcnow() - self._cache_timestamp < self._cache_ttl
 
     def analyze_file(
         self,
@@ -217,9 +232,9 @@ class RiskAnalyzer:
         history: list[datetime],
     ) -> RiskFactor | None:
         """Assess change frequency risk."""
-        # Count changes in last 30 days
+        # Count changes in last 30 days - use timedelta for correct calculation
         now = datetime.utcnow()
-        thirty_days_ago = datetime(now.year, now.month - 1 if now.month > 1 else 12, now.day)
+        thirty_days_ago = now - timedelta(days=30)
 
         recent_changes = sum(1 for dt in history if dt > thirty_days_ago)
 
@@ -278,8 +293,10 @@ class RiskAnalyzer:
 
     def _assess_centrality(self, file_path: str) -> RiskFactor | None:
         """Assess centrality risk (how many files depend on this)."""
-        if self._centrality_cache is None:
+        # Check if cache needs refresh
+        if not self._is_cache_valid():
             self._centrality_cache = self.graph.get_centrality_scores()
+            self._cache_timestamp = datetime.utcnow()
 
         centrality = self._centrality_cache.get(file_path, 0)
         dependents = self.graph.get_dependents(file_path)
