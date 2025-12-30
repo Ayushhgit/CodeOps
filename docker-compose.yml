@@ -24,10 +24,11 @@ services:
       - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+      - GROQ_API_KEY=${GROQ_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - AI_PROVIDER=${AI_PROVIDER:-anthropic}
-      - AI_MODEL=${AI_MODEL:-claude-3-5-sonnet-20241022}
+      - AI_PROVIDER=${AI_PROVIDER:-groq}
+      - AI_MODEL=${AI_MODEL:-llama-3.3-70b-versatile}
     volumes:
       - ./backend/app:/app/app:ro
       - ./github-app-private-key.pem:/app/github-app-private-key.pem:ro
@@ -53,6 +54,7 @@ services:
       - APP_ENV=development
       - DATABASE_URL=postgresql+asyncpg://codeops:codeops@postgres:5432/codeops
       - REDIS_URL=redis://redis:6379/0
+      - GROQ_API_KEY=${GROQ_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:

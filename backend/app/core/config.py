@@ -40,10 +40,11 @@ class Settings(BaseSettings):
     github_client_secret: str = ""
 
     # AI Providers
+    groq_api_key: str = ""  # FREE! Get key at https://console.groq.com
     openai_api_key: str = ""
     anthropic_api_key: str = ""
-    ai_provider: Literal["openai", "anthropic"] = "anthropic"
-    ai_model: str = "claude-3-5-sonnet-20241022"
+    ai_provider: Literal["groq", "openai", "anthropic"] = "groq"
+    ai_model: str = "llama-3.3-70b-versatile"  # Free on Groq
 
     # Feature Flags - WRITE ACCESS IS OFF BY DEFAULT
     enable_write_mode: bool = False
