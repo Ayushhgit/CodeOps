@@ -20,38 +20,67 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
+# Pinned dependencies for reproducible builds
 dependencies = [
-    "fastapi>=0.109.0",
-    "uvicorn[standard]>=0.27.0",
-    "pydantic>=2.5.0",
-    "pydantic-settings>=2.1.0",
-    "sqlalchemy>=2.0.25",
-    "asyncpg>=0.29.0",
-    "alembic>=1.13.0",
-    "redis>=5.0.0",
-    "httpx>=0.26.0",
-    "PyJWT>=2.8.0",
-    "cryptography>=41.0.0",
-    "python-multipart>=0.0.6",
-    "arq>=0.25.0",
-    "gitpython>=3.1.40",
-    "tree-sitter>=0.20.0",
-    "networkx>=3.2.0",
-    "structlog>=24.1.0",
-    "openai>=1.10.0",
-    "anthropic>=0.18.0",
-    "tiktoken>=0.5.0",
+    # Web Framework
+    "fastapi==0.109.2",
+    "uvicorn[standard]==0.27.1",
+    "starlette==0.36.3",
+
+    # Validation & Settings
+    "pydantic==2.6.1",
+    "pydantic-settings==2.2.1",
+
+    # Database
+    "sqlalchemy[asyncio]==2.0.27",
+    "asyncpg==0.29.0",
+    "alembic==1.13.1",
+
+    # Redis & Task Queue
+    "redis==5.0.1",
+    "arq==0.25.0",
+
+    # HTTP Client
+    "httpx==0.26.0",
+
+    # Authentication & Security
+    "PyJWT[crypto]==2.8.0",
+    "cryptography==42.0.2",
+
+    # File Upload
+    "python-multipart==0.0.9",
+
+    # Git Operations
+    "gitpython==3.1.42",
+
+    # Code Analysis
+    "tree-sitter==0.21.3",
+    "networkx==3.2.1",
+
+    # Logging
+    "structlog==24.1.0",
+
+    # AI Providers
+    "openai==1.12.0",
+    "anthropic==0.18.1",
+    "tiktoken==0.6.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.1.0",
-    "httpx>=0.26.0",
-    "mypy>=1.8.0",
-    "ruff>=0.1.14",
-    "pre-commit>=3.6.0",
+    # Testing
+    "pytest==8.0.1",
+    "pytest-asyncio==0.23.4",
+    "pytest-cov==4.1.0",
+    "httpx==0.26.0",
+
+    # Type Checking
+    "mypy==1.8.0",
+    "types-redis==4.6.0.20240106",
+
+    # Linting & Formatting
+    "ruff==0.2.1",
+    "pre-commit==3.6.1",
 ]
 
 [project.scripts]
@@ -66,8 +95,25 @@ target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W", "B", "Q"]
-ignore = ["E501"]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "W",      # pycodestyle warnings
+    "B",      # flake8-bugbear
+    "Q",      # flake8-quotes
+    "S",      # flake8-bandit (security)
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "S101",   # assert usage (ok in tests)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -77,3 +123,8 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["tests/*", "app/cli.py"]
